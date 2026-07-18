@@ -69,7 +69,7 @@ from Eurostat because the corresponding FRED (OECD) series were discontinued in 
 | STEP 5 | the five deliverable plots |
 | STEP 6 | saved outputs + final summary |
 
-Known limitations (discussed in the report): final-vintage data (no real-time
+Known limitations (to be discussed in the final report): final-vintage data (no real-time
 vintages), simple calendar-based publication lags, DFM parameters estimated once
 (filter-only updates in the evaluation loop), optimizer stops at `success=False`
 (flat likelihood near the optimum; estimates stable across restarts).
