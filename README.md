@@ -1,5 +1,5 @@
 # Nowcasting & Forecasting Italian GDP
-### DFM/Kalman nowcast + VAR/BVAR forecast — project based on the BSE Summer School course (G. Pérez-Quirós)
+### DFM/Kalman nowcast + VAR/BVAR forecast 
 
 Author: Vassily Dal Bo
 
