@@ -9,7 +9,7 @@
            anchored on the nowcast, COVID handled with dummies
    STEP 4  pseudo-real-time out-of-sample evaluation
            (RMSFE vs AR(1)/RW, Diebold-Mariano, with/without 2020)
-   STEP 5  the five deliverable plots
+   STEP 5  the five deliverable plots + nowcast accuracy by vintage
    STEP 6  saved outputs + final summary
 
  Data: FRED (GDP, exports, unemployment, HICP, 3m rate) and
@@ -18,6 +18,7 @@
 ============================================================
 """
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -26,10 +27,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
 from scipy.optimize import minimize
-from scipy.stats import invwishart, norm
+from scipy.stats import invwishart, t as student_t
 import warnings
 warnings.filterwarnings("ignore")
 np.random.seed(0)                           # reproducible random fill of missing values
+os.chdir(Path(__file__).resolve().parent)   # relative paths work from any working directory
 
 # ============================================================
 #  CONFIG — every choice of the project in one place
@@ -41,13 +43,21 @@ EVAL_START   = "2012-01-01"                 # out-of-sample evaluation starts he
 P_VAR, P_BVAR, H = 2, 4, 4                  # VAR lags, BVAR lags, forecast horizon
 LAM = dict(lam1=0.2, lam2=0.5, lam3=1.0, lam4=100.0)   # Minnesota hyperparameters (§7.4.3)
 COVID_QUARTERS = ("2020Q1", "2020Q2", "2020Q3")        # Italy locked down in March 2020
+COVID_MONTHS = ("2020-03-01", "2020-09-01")            # DFM: treated as missing in estimation
 PUB_LAGS = {"ip": 2, "retail": 2, "exports": 2,        # publication lags in months:
             "unemp": 1, "bci": 0, "cci": 0, "gdp": 2}  # surveys immediate, hard data late
 W_AGG = np.array([1, 2, 3, 2, 1]) / 3.0     # mixed-frequency aggregation weights (Ch.2/5)
+NC_VINTAGES = (-2, -1, 0, 1)                # nowcast evaluated at months 1, 2, 3 of the quarter
+                                            # and one month after (just before the GDP release)
+REEST_EVERY = 4                             # out-of-sample: re-estimate the DFM every 4 quarters
 
 # ============================================================
 #  SHARED HELPERS
 # ============================================================
+
+def is_covid(index):
+    """Monthly dates inside COVID_MONTHS (the monthly counterpart of the VAR dummies)."""
+    return (index >= COVID_MONTHS[0]) & (index <= COVID_MONTHS[1])
 
 def build_X(data, p, dummies=None):
     """Regressor matrix: constant + p lags of all variables (+ optional dummies)."""
@@ -157,8 +167,8 @@ def matrices(theta):
     lam_g      = theta[8]                    # GDP loading
     psi        = theta[9:21].reshape(6, 2)   # monthly idio AR(2)
     psiG       = theta[21:23]                # GDP idio AR(2)
-    sig2       = np.exp(theta[23:29])        # idio variances (log-parametrized > 0)
-    sig2_g     = np.exp(theta[29])
+    sig2       = np.exp(theta[23:29]) + 1e-4 # idio variances (log-parametrized > 0, floor
+    sig2_g     = np.exp(theta[29]) + 1e-4    # keeps F10 invertible when one collapses)
     nf = 12
     m, n = nf + 5 + 12, 7
     F0, G0, E0 = 0, nf, nf + 5               # block starts: factor, GDP idio, monthly idio
@@ -192,7 +202,11 @@ clean = pd.read_csv("data/clean/clean_stationary.csv", index_col=0, parse_dates=
 cols  = ["ip", "retail", "exports", "unemp", "bci", "cci", "gdp"]
 panel = clean[cols].copy()
 panel["gdp"] = panel["gdp"].shift(2)         # quarterly GDP -> 3rd month of the quarter (§5.1.1)
-mu_p, sd_p = panel.mean(), panel.std()
+# the quarter to nowcast is the first one without published GDP; if the monthly data
+# stop before its last month, extend the calendar with empty months (the filter predicts them)
+target_now = panel["gdp"].last_valid_index() + pd.DateOffset(months=3)
+panel = panel.reindex(pd.date_range(panel.index[0], max(panel.index[-1], target_now), freq="MS"))
+mu_p, sd_p = panel[~is_covid(panel.index)].mean(), panel[~is_covid(panel.index)].std()
 panelz = (panel - mu_p) / sd_p               # standardized panel
 obs_mask = (~panelz.isna()).astype(float).values     # 1 = observed, 0 = missing (the s_t of §5.2)
 yv = panelz.values.copy()
@@ -223,8 +237,55 @@ def kalman_filter(theta, yv, obs_mask, burn=12):
         filt[t] = beta.ravel()
     return like[burn:].sum(), filt           # burn-in: skip the diffuse start
 
-def neg_loglik(theta):
-    return -kalman_filter(theta, yv, obs_mask)[0]
+def estimate_dfm(theta_start, yv, obs_mask, index, maxiter=1000):
+    """MLE by BFGS. The COVID months enter the likelihood as missing: otherwise the
+       2020 swings (IP -30% / +40% in a month) dominate the estimates and, after 2020,
+       inflate the GDP loading. They are still filtered when nowcasting.
+       Sign normalization on theta (not on the filtered states): flipping all
+       loadings flips the factor and leaves the implied GDP nowcast unchanged."""
+    mask_est = obs_mask.copy()
+    mask_est[is_covid(index)] = 0.0
+    def objective(th):
+        # explosive trial points (e.g. idio AR roots > 1) make the filter blow up:
+        # return a large value so that the BFGS line search steps back
+        try:
+            v = -kalman_filter(th, yv, mask_est)[0]
+        except np.linalg.LinAlgError:
+            return 1e10
+        return v if np.isfinite(v) else 1e10
+    res = minimize(objective, theta_start,
+                   method="BFGS", options={"maxiter": maxiter})
+    theta = res.x.copy()
+    if theta[2] < 0:                         # factor identified up to sign -> align with IP
+        theta[2:9] *= -1
+    return theta, res
+
+def standardize(sub, rng):
+    """Standardize a (sub-)panel on its own sample (COVID months excluded from the
+       moments, as in Step 2), build the mask, fill the holes."""
+    normal = sub[~is_covid(sub.index)]
+    mu, sd = normal.mean(), normal.std()
+    sz = (sub - mu) / sd
+    mask = (~sz.isna()).astype(float).values
+    y = sz.values.copy()
+    y[np.isnan(y)] = rng.standard_normal(int(np.isnan(y).sum()))
+    return y, mask, mu, sd
+
+def ragged_edge(vintage, last=None):
+    """Information set at the vintage month: each series revealed only up to
+       vintage minus its publication lag (calendar-based, final-vintage values)."""
+    last = vintage if last is None else max(last, vintage)
+    sub = panel.reindex(pd.date_range(panel.index[0], last, freq="MS"))
+    for c in cols:
+        sub.loc[sub.index > vintage - pd.DateOffset(months=PUB_LAGS[c]), c] = np.nan
+    return sub
+
+def dfm_nowcast(theta, sub, target_end, seed=0):
+    """Factor-implied GDP growth for the quarter ending at target_end, given sub."""
+    y, mask, mu, sd = standardize(sub, np.random.default_rng(seed))
+    _, fw = kalman_filter(theta, y, mask)
+    i_t = sub.index.get_loc(target_end)
+    return (fw[i_t, 0:5] @ (theta[8] * W_AGG)) * sd["gdp"] + mu["gdp"]
 
 # hand-picked starting values (as Homework1.m)
 theta0 = np.array([
@@ -238,17 +299,11 @@ theta0 = np.array([
 ])
 
 print("STEP 2 — estimating the DFM by MLE (may take 1-2 min)...")
-res = minimize(neg_loglik, theta0, method="BFGS", options={"maxiter": 1000})
+theta_hat, res = estimate_dfm(theta0, yv, obs_mask, dates)
 print("  done. success:", res.success, " -loglik:", round(res.fun, 2))
-theta_hat = res.x
 
 ll, filt = kalman_filter(theta_hat, yv, obs_mask)
 factor = filt[:, 0]
-
-# sign normalization: the factor is identified up to sign -> align it with IP
-mask_ip = ~panelz["ip"].isna().values
-if np.corrcoef(factor[mask_ip], panelz["ip"].values[mask_ip])[0, 1] < 0:
-    factor, filt = -factor, -filt
 
 # factor-implied nowcast: GDP row applied to the factor block only
 # (excludes the GDP idiosyncratic -> honest signal from the monthly indicators)
@@ -272,8 +327,8 @@ nowcast_table = pd.DataFrame({
 
 print("\n=== GDP nowcast by quarter ===")
 print(nowcast_table.tail(6).round(2))
-cur_label = nowcast_table.index[-1]
-nowcast_now = float(nowcast_table["nowcast_%"].iloc[-1])
+cur_label = f"{target_now.year}Q{(target_now.month - 1)//3 + 1}"
+nowcast_now = float(nowcast_table.loc[cur_label, "nowcast_%"])
 print(f"\n>>> Nowcast {cur_label}: {nowcast_now:+.2f}%   (GDP not yet published)")
 
 # ============================================================
@@ -388,8 +443,13 @@ def gdp_fan(paths, labels):
 q_gdp   = 100 * np.log(series["gdp"]).diff()
 hicp_q  = series["hicp"].resample("QS").mean()
 q_infl_raw = 100 * np.log(hicp_q).diff()
-seas    = q_infl_raw.groupby(q_infl_raw.index.quarter).transform("mean")
-q_infl  = q_infl_raw - seas + q_infl_raw.mean()      # HICP is NSA: remove seasonal means
+
+def deseason(x):
+    """HICP is NSA: remove quarter-specific means, estimated on x's own sample only
+       (re-applied inside each evaluation window -> no look-ahead in Step 4)."""
+    return x - x.groupby(x.index.quarter).transform("mean") + x.mean()
+
+q_infl  = deseason(q_infl_raw)
 q_unemp = series["unemp"].resample("QS").mean()
 q_rate  = series["rate3m"].resample("QS").mean()
 qdata = pd.DataFrame({"gdp": q_gdp, "infl": q_infl, "unemp": q_unemp,
@@ -432,15 +492,17 @@ print(gdp_fan(paths_dum, labels).round(2))
 # ============================================================
 #  STEP 4 — PSEUDO-REAL-TIME OUT-OF-SAMPLE EVALUATION
 # ============================================================
-# Expanding window from EVAL_START: at each quarter, use ONLY data up to that
-# point, forecast h=1..4, compare with the realized value.
-# DFM parameters are estimated once (full sample) and kept fixed; only the
-# filter is re-run per window (standard shortcut). The AR(1) benchmark gets
-# the COVID dummies too (as macro4.m) so the race is fair.
+# Expanding window from EVAL_START: at each date, use ONLY the information
+# available then. Nowcasts respect the publication lags (ragged edge) and the
+# DFM is re-estimated every REEST_EVERY quarters on the data available at that
+# date (warm start from the previous estimate). Data are final-vintage (no
+# real-time revisions). The AR(1) benchmark gets the COVID dummies too
+# (as macro4.m) so the race is fair.
 
 def bvar_mean(df, p=4, levels=None, dummies=None, **lam):
-    """Minnesota BVAR, analytic posterior mean (= Gibbs median for point forecasts).
-       Used inside the evaluation loop: no simulation needed for point accuracy."""
+    """Minnesota BVAR, analytic posterior mean with the residual variance fixed at
+       the AR(p) scale s_i^2 (Litterman). Close to the Gibbs median for point
+       forecasts and much faster: used inside the evaluation loop."""
     lamd = {**LAM, **lam}
     data = df.values; n = data.shape[1]
     if levels is None: levels = [False] * n
@@ -471,42 +533,114 @@ def ar1_forecast(y, h=4, dummies=None):
     return np.array(f)
 
 def dm_test(e1, e2, h=1):
-    """Diebold-Mariano (1995) on squared errors, Newey-West variance (lag h-1).
-       DM > 0 -> model 2 more accurate; ~N(0,1) under equal accuracy."""
+    """Diebold-Mariano (1995) on squared errors with the Harvey-Leybourne-Newbold
+       (1997) small-sample correction and Student-t(T-1) p-values (here T ~ 50).
+       Long-run variance: autocovariances up to lag h-1 (Bartlett if not positive).
+       DM > 0 -> model 2 more accurate."""
     d = e1 ** 2 - e2 ** 2
     T = len(d); dbar = d.mean(); dd = d - dbar
-    var = np.sum(dd ** 2) / T
-    for l in range(1, h):
-        var += 2 * (1 - l / h) * np.sum(dd[l:] * dd[:-l]) / T
+    gam = [np.sum(dd[l:] * dd[:T - l]) / T for l in range(h)]
+    var = gam[0] + 2 * sum(gam[1:])
+    if var <= 0:
+        var = gam[0] + 2 * sum((1 - l / h) * gam[l] for l in range(1, h))
     dm = dbar / np.sqrt(var / T)
-    return dm, 2 * (1 - norm.cdf(abs(dm)))
+    dm *= np.sqrt((T + 1 - 2 * h + h * (h - 1) / T) / T)
+    return dm, 2 * student_t.sf(abs(dm), df=T - 1)
 
-# ---- 4a: expanding-window race, h=1..4 ----
+def qlabel(d):
+    return f"{d.year}Q{(d.month - 1)//3 + 1}"
+
+# ---- 4a: DFM nowcast vs AR(1), by vintage within the quarter ----
 print("\nSTEP 4 — out-of-sample evaluation (expanding window)...")
+qends = [d for d in panel.index
+         if d.month in (3, 6, 9, 12) and d >= pd.Timestamp(EVAL_START) and not np.isnan(panel.loc[d, "gdp"])]
+
+# re-estimation dates: one every REEST_EVERY quarters, the first before any nowcast
+reest_dates = pd.date_range(qends[0] + pd.DateOffset(months=min(NC_VINTAGES)),
+                            qends[-1] + pd.DateOffset(months=max(NC_VINTAGES)),
+                            freq=f"{3 * REEST_EVERY}MS")
+thetas, th = {}, theta0
+print(f"  re-estimating the DFM at {len(reest_dates)} dates (a few minutes)...")
+for r in reest_dates:
+    sub_r = ragged_edge(r)
+    y_r, m_r, _, _ = standardize(sub_r, np.random.default_rng(0))
+    th, res_r = estimate_dfm(th, y_r, m_r, sub_r.index, maxiter=1000 if r == reest_dates[0] else 300)
+    thetas[r] = th
+    print(f"    {r:%Y-%m}  -loglik {res_r.fun:8.2f}  lam_g {th[8]:.3f}")
+
+def theta_at(v):
+    """Latest estimate available at vintage v."""
+    return thetas[max(r for r in thetas if r <= v)]
+
+covid_qend = [pd.Period(q, "Q").end_time.normalize().replace(day=1) for q in COVID_QUARTERS]
+rows_nc = []
+for qe in qends:
+    real = panel.loc[qe, "gdp"]
+    for k in NC_VINTAGES:
+        v = qe + pd.DateOffset(months=k)
+        sub = ragged_edge(v, last=qe)
+        nc_val = dfm_nowcast(theta_at(v), sub, qe)
+        g = sub["gdp"].dropna()                     # GDP published at the vintage
+        steps = (qe.year - g.index[-1].year) * 4 + (qe.month - g.index[-1].month) // 3
+        Dg = np.column_stack([(g.index == c).astype(float) for c in covid_qend if c in g.index]) \
+             if any(c in g.index for c in covid_qend) else None
+        ar = ar1_forecast(g.values, h=steps, dummies=Dg)[-1]
+        rows_nc.append(dict(q=qlabel(qe), qend=qe, vintage=k, nowcast=nc_val, ar1=ar, real=real))
+r_nc = pd.DataFrame(rows_nc)
+r_nc["ex2020"] = r_nc.qend.dt.year != 2020
+
+def nc_table(df):
+    out = []
+    for k in NC_VINTAGES:
+        s = df[df.vintage == k]
+        e_nc, e_ar = (s.nowcast - s.real).values, (s.ar1 - s.real).values
+        dm, p = dm_test(e_ar, e_nc, h=1)
+        rn, ra = np.sqrt(np.mean(e_nc ** 2)), np.sqrt(np.mean(e_ar ** 2))
+        out.append(dict(vintage=f"m{k + 3}" if k <= 0 else f"+{k}m", n=len(s),
+                        rmsfe_dfm=rn, rmsfe_ar1=ra, ratio=rn / ra, DM=dm, p=p))
+    return pd.DataFrame(out).set_index("vintage")
+
+nc_all, nc_ex = nc_table(r_nc), nc_table(r_nc[r_nc.ex2020])
+print("\n=== DFM nowcast vs AR(1), pseudo-real-time, by vintage ===")
+print("  (m1-m3 = month of the target quarter, +1m = one month after its end;")
+print("   DM > 0 -> nowcast more accurate)")
+print("  full sample:");  print(nc_all.round(3).to_string())
+print("  excl. 2020:");   print(nc_ex.round(3).to_string())
+
+# ---- 4b: expanding-window race, h=1..4 ----
+# h=1 is the quarter after the last published GDP, i.e. the current quarter at the
+# release date. "BVAR+NC" is the production pipeline of Step 3: the BVAR anchored on
+# the DFM nowcast available at that date (vintage = month 2 of the quarter).
+nc_anchor = r_nc[r_nc.vintage == -1].set_index("qend")["nowcast"]
 gdp_q = qdata["gdp"]
 start = qdata.index.get_loc(pd.Timestamp(EVAL_START))
 rows = []
 for t0 in range(start, len(qdata) - 1):
-    train = qdata.iloc[:t0 + 1]
+    train = qdata.iloc[:t0 + 1].copy()
+    train["infl"] = deseason(q_infl_raw.loc[:train.index[-1]]).reindex(train.index)
     Dtr = D[:t0 + 1]; keep = Dtr.sum(axis=0) > 0      # dummies only once 2020 is in the window
     Dtr2 = Dtr[:, keep] if keep.any() else None
     nd = 0 if Dtr2 is None else Dtr2.shape[1]
     Bv, _, _, _ = var_ols(train, p=P_VAR, dummies=Dtr2)
-    f_var = var_forecast(Bv, train, h=H, p=P_VAR, n_dummies=nd)[1:, 0]
+    f_var = var_forecast(Bv, train, h=H, p=P_VAR, n_dummies=nd)[:H, 0]   # step 0 = t0+1
     Bb = bvar_mean(train, p=P_BVAR, levels=lev, dummies=Dtr2)
-    f_bvar = var_forecast(Bb, train, h=H, p=P_BVAR, n_dummies=nd)[1:, 0]
+    f_bvar = var_forecast(Bb, train, h=H, p=P_BVAR, n_dummies=nd)[:H, 0]
+    qe_next = qdata.index[t0 + 1] + pd.DateOffset(months=2)
+    cur = np.array([nc_anchor.get(qe_next, np.nan), np.nan, np.nan, np.nan])
+    f_bnc = var_forecast(Bb, train, h=H, p=P_BVAR, current=cur, n_dummies=nd)[:H, 0]
     f_ar = ar1_forecast(train["gdp"].values, h=H, dummies=Dtr2)
     f_rw = np.repeat(train["gdp"].iloc[-1], H)
     for h in range(1, H + 1):
         if t0 + h < len(qdata):
             rows.append(dict(origin=qdata.index[t0], target=qdata.index[t0 + h], h=h,
                              real=gdp_q.iloc[t0 + h], VAR=f_var[h - 1], BVAR=f_bvar[h - 1],
-                             AR1=f_ar[h - 1], RW=f_rw[h - 1]))
+                             BVAR_NC=f_bnc[h - 1], AR1=f_ar[h - 1], RW=f_rw[h - 1]))
 res_oos = pd.DataFrame(rows)
+MODELS = ["AR1", "RW", "VAR", "BVAR", "BVAR_NC"]
 
 def rmsfe_table(df):
     out = {m: [np.sqrt(((df[df.h == h][m] - df[df.h == h].real) ** 2).mean())
-               for h in range(1, H + 1)] for m in ["AR1", "RW", "VAR", "BVAR"]}
+               for h in range(1, H + 1)] for m in MODELS}
     tab = pd.DataFrame(out, index=[f"h={h}" for h in range(1, H + 1)]).T
     return tab, tab / tab.loc["AR1"]
 
@@ -516,48 +650,20 @@ tab_ex,  rel_ex  = rmsfe_table(res_oos[mask_ex])
 print("\n=== RMSFE relative to AR(1), FULL eval sample ===");  print(rel_all.round(3))
 print("\n=== RMSFE relative to AR(1), EXCLUDING 2020 ===");    print(rel_ex.round(3))
 
-print("\n=== Diebold-Mariano: VAR vs BVAR (excl. 2020) ===")
-for h in range(1, H + 1):
-    sub = res_oos[mask_ex & (res_oos.h == h)]
-    dm, p = dm_test((sub.VAR - sub.real).values, (sub.BVAR - sub.real).values, h=h)
-    print(f"  h={h}: DM={dm:+.2f} p={p:.3f}  -> better: {'BVAR' if dm > 0 else 'VAR'}")
-print("=== Diebold-Mariano: BVAR vs AR(1) (excl. 2020) ===")
-for h in range(1, H + 1):
-    sub = res_oos[mask_ex & (res_oos.h == h)]
-    dm, p = dm_test((sub.BVAR - sub.real).values, (sub.AR1 - sub.real).values, h=h)
-    print(f"  h={h}: DM={dm:+.2f} p={p:.3f}  -> better: {'AR1' if dm > 0 else 'BVAR'}")
+def dm_block(m1, m2):
+    """DM (HLN) of m1 vs m2 at each horizon, excl. 2020; DM > 0 -> m2 more accurate."""
+    out = []
+    for h in range(1, H + 1):
+        sub = res_oos[mask_ex & (res_oos.h == h)]
+        out.append(dm_test((sub[m1] - sub.real).values, (sub[m2] - sub.real).values, h=h))
+    return out
 
-# ---- 4b: pseudo-real-time DFM nowcast (h=0) vs AR(1) ----
-# At each quarter end: cut the panel, hide the target GDP, re-standardize on
-# the window only (no look-ahead), re-run the filter, read the nowcast.
-rng_nc = np.random.default_rng(1)
-rows_nc = []
-for cut in [d for d in panel.index if d.month in (3, 6, 9, 12) and d >= pd.Timestamp(EVAL_START)]:
-    i = panel.index.get_loc(cut)
-    sub = panel.iloc[:i + 1].copy()
-    real = sub.loc[cut, "gdp"]
-    if np.isnan(real): continue
-    sub.loc[cut, "gdp"] = np.nan
-    mu_w, sd_w = sub.mean(), sub.std()
-    sz = (sub - mu_w) / sd_w
-    iw = (~sz.isna()).astype(float).values
-    yw = sz.values.copy()
-    yw[np.isnan(yw)] = rng_nc.standard_normal(int(np.isnan(yw).sum()))
-    _, fw = kalman_filter(theta_hat, yw, iw)
-    nc_val = (fw[-1, 0:5] @ (theta_hat[8] * W_AGG)) * sd_w["gdp"] + mu_w["gdp"]
-    g = sub["gdp"].dropna().values
-    Xa = np.column_stack([np.ones(len(g) - 1), g[:-1]])
-    b = np.linalg.solve(Xa.T @ Xa, Xa.T @ g[1:])
-    rows_nc.append(dict(q=cut, nowcast=nc_val, ar1=b[0] + b[1] * g[-1], real=real))
-r_nc = pd.DataFrame(rows_nc).set_index("q")
-
-print("\n=== DFM nowcast (h=0) vs AR(1), pseudo-real-time ===")
-m20 = (r_nc.index < "2020-01") | (r_nc.index > "2020-12")
-for lbl, m in [("full", r_nc.index == r_nc.index), ("excl 2020", m20)]:
-    s = r_nc[m]
-    rn = np.sqrt(((s.nowcast - s.real) ** 2).mean())
-    ra = np.sqrt(((s.ar1 - s.real) ** 2).mean())
-    print(f"  {lbl:10s} n={len(s)}  RMSFE nowcast={rn:.3f}  AR1={ra:.3f}  ratio={rn/ra:.3f}")
+dm_results = {}
+for m1, m2 in [("VAR", "BVAR"), ("AR1", "BVAR"), ("AR1", "BVAR_NC"), ("BVAR", "BVAR_NC")]:
+    dm_results[(m1, m2)] = dm_block(m1, m2)
+    print(f"=== Diebold-Mariano (HLN): {m1} vs {m2} (excl. 2020) ===")
+    for h, (dm, p) in enumerate(dm_results[(m1, m2)], start=1):
+        print(f"  h={h}: DM={dm:+.2f} p={p:.3f}  -> better: {m2 if dm > 0 else m1}")
 
 # ============================================================
 #  STEP 5 — THE FIVE DELIVERABLE PLOTS
@@ -575,22 +681,9 @@ Path("plots").mkdir(exist_ok=True)
 
 # ---- Plot 1: intra-quarter nowcast evolution (the assignment's showcase) ----
 def realtime_nowcast(target_end, vintage):
-    """Nowcast of the quarter ending at target_end, seen at the vintage month:
-       each series revealed only up to vintage minus its publication lag."""
-    last = max(target_end, vintage)
-    sub = panel.loc[:last].copy()
-    for c in cols:
-        avail = vintage - pd.DateOffset(months=PUB_LAGS[c])
-        sub.loc[sub.index > avail, c] = np.nan
-    mu_w, sd_w = sub.mean(), sub.std()
-    sz = (sub - mu_w) / sd_w
-    iw = (~sz.isna()).astype(float).values
-    yw = sz.values.copy()
-    rng = np.random.default_rng(0)
-    yw[np.isnan(yw)] = rng.standard_normal(int(np.isnan(yw).sum()))
-    _, fw = kalman_filter(theta_hat, yw, iw)
-    i_t = sub.index.get_loc(target_end)
-    return (fw[i_t, 0:5] @ (theta_hat[8] * W_AGG)) * sd_w["gdp"] + mu_w["gdp"]
+    """Nowcast of the quarter ending at target_end, seen at the vintage month
+       (ragged edge as in Step 4; full-sample parameters, illustration only)."""
+    return dfm_nowcast(theta_hat, ragged_edge(vintage, last=target_end), target_end)
 
 targets = {"2011Q4 — recession": "2011-12-01",
            "2017Q2 — calm":      "2017-06-01",
@@ -704,27 +797,46 @@ plt.tight_layout(); plt.savefig("plots/p4_var_bvar.png", dpi=150, bbox_inches="t
 plt.close(); print("plot 4 saved")
 
 # ---- Plot 5: relative RMSFE bars (the Step 4 verdict in one picture) ----
-fig, ax = plt.subplots(figsize=(10, 4.8))
-xpos = np.arange(H); wd = 0.26
-for i, (mn, color) in enumerate([("RW", "#999999"), ("VAR", BLUE), ("BVAR", RED)]):
+fig, ax = plt.subplots(figsize=(10.5, 4.8))
+xpos = np.arange(H); wd = 0.2
+bars = [("RW", "#999999", "RW"), ("VAR", BLUE, "VAR(2)"), ("BVAR", RED, "BVAR(4)"),
+        ("BVAR_NC", "#762a83", "BVAR(4) + nowcast")]
+for i, (mn, color, lbl) in enumerate(bars):
     vals = rel_ex.loc[mn].values
-    ax.bar(xpos + (i - 1) * wd, np.minimum(vals, 2.0), wd, label=mn, color=color, alpha=.9)
-    for x, v in zip(xpos + (i - 1) * wd, vals):
+    xs = xpos + (i - 1.5) * wd
+    ax.bar(xs, np.minimum(vals, 2.0), wd, label=lbl, color=color, alpha=.9)
+    for x, v in zip(xs, vals):
         ax.annotate(f"{v:.2f}" if v <= 2 else f"{v:.1f}↑", xy=(x, min(v, 2.0)),
                     xytext=(0, 4), textcoords="offset points",
-                    ha="center", fontsize=9, fontweight="bold")
+                    ha="center", fontsize=8.5, fontweight="bold")
 ax.axhline(1.0, color="black", lw=1.4, ls="--")
-ax.annotate("AR(1) benchmark = 1   (below the line = better than AR(1))",
-            xy=(0.02, 1.0), xycoords=("axes fraction", "data"), xytext=(0, 6),
-            textcoords="offset points", fontsize=10)
 ax.set_xticks(xpos)
 ax.set_xticklabels([f"{h} quarter{'s' if h > 1 else ''}" for h in range(1, H + 1)])
-ax.set_xlabel("forecast horizon"); ax.set_ylabel("RMSFE relative to AR(1)")
+ax.set_xlabel("forecast horizon"); ax.set_ylabel("RMSFE relative to AR(1)\n(< 1 = better than AR(1))")
 ax.set_ylim(0, 2.15)
 ax.set_title("Out-of-sample forecast accuracy relative to AR(1), excluding 2020")
-ax.legend(loc="upper left")
+ax.legend(loc="upper left", ncol=2)
 plt.tight_layout(); plt.savefig("plots/p5_rmsfe.png", dpi=150, bbox_inches="tight")
 plt.close(); print("plot 5 saved")
+
+# ---- Plot 6: nowcast accuracy as the quarter unfolds (pseudo-real-time) ----
+fig, ax = plt.subplots(figsize=(8.5, 4.4))
+xv = np.arange(len(NC_VINTAGES))
+ax.plot(xv, nc_ex["rmsfe_dfm"], "o-", color=BLUE, lw=2.2, ms=7, label="DFM nowcast")
+ax.plot(xv, nc_ex["rmsfe_ar1"], "s--", color=GRAY, lw=1.6, ms=6, label="AR(1)")
+for x, v, r in zip(xv, nc_ex["rmsfe_dfm"], nc_ex["ratio"]):
+    ax.annotate(f"{v:.2f}  (×{r:.2f})", xy=(x, v), xytext=(0, -16), textcoords="offset points",
+                ha="center", fontsize=9, color=BLUE)
+ax.set_xticks(xv)
+ax.set_xticklabels(["month 1", "month 2", "month 3", "1 month after"])
+ax.set_xlabel("vintage (position in the target quarter)")
+ax.set_ylabel("RMSFE (pp)")
+ax.set_ylim(0, None)
+ax.set_title(f"Nowcast error shrinks as monthly data arrive "
+             f"({pd.Timestamp(EVAL_START).year}-{qends[-1].year}, excl. 2020)")
+ax.legend(loc="lower left")
+plt.tight_layout(); plt.savefig("plots/p6_nowcast_vintages.png", dpi=150, bbox_inches="tight")
+plt.close(); print("plot 6 saved")
 
 # ============================================================
 #  STEP 6 — SAVED OUTPUTS & FINAL SUMMARY
@@ -743,20 +855,14 @@ forecast_table.to_csv(OUT / "forecast_var_bvar.csv")
 res_oos.round(4).to_csv(OUT / "oos_forecasts.csv", index=False)
 rel_all.round(3).to_csv(OUT / "rmsfe_relative_full.csv")
 rel_ex.round(3).to_csv(OUT / "rmsfe_relative_ex2020.csv")
-r_nc.round(3).to_csv(OUT / "nowcast_oos_eval.csv")
+r_nc.drop(columns="qend").round(3).to_csv(OUT / "nowcast_oos_eval.csv", index=False)
+pd.concat({"full": nc_all, "ex2020": nc_ex}).round(3).to_csv(OUT / "nowcast_rmsfe_by_vintage.csv")
+pd.DataFrame(thetas).T.round(4).rename_axis("estimated_at").to_csv(OUT / "theta_realtime.csv")
 np.save(OUT / "theta_hat.npy", theta_hat)
 
-# nowcast accuracy ratios (vs AR(1), pseudo-real-time)
-ratio_full = (np.sqrt(((r_nc.nowcast - r_nc.real) ** 2).mean())
-              / np.sqrt(((r_nc.ar1 - r_nc.real) ** 2).mean()))
-ratio_ex = (np.sqrt(((r_nc[m20].nowcast - r_nc[m20].real) ** 2).mean())
-            / np.sqrt(((r_nc[m20].ar1 - r_nc[m20].real) ** 2).mean()))
-# at how many horizons does the BVAR beat the VAR? (DM sign)
-dm_wins = sum(dm_test((res_oos[mask_ex & (res_oos.h == h)].VAR
-                       - res_oos[mask_ex & (res_oos.h == h)].real).values,
-                      (res_oos[mask_ex & (res_oos.h == h)].BVAR
-                       - res_oos[mask_ex & (res_oos.h == h)].real).values,
-                      h=h)[0] > 0 for h in range(1, H + 1))
+sig = lambda res: sum(p < 0.05 for _, p in res)
+wins = lambda res: sum(dm > 0 for dm, _ in res)
+dm_vb = dm_results[("VAR", "BVAR")]
 
 L = "=" * 64
 print(f"""
@@ -768,8 +874,10 @@ print(f"""
 
   NOWCAST — current quarter
     {cur_label}: {nowcast_now:+.2f}%   (GDP not yet published)
-    accuracy vs AR(1), pseudo-real-time {pd.Timestamp(EVAL_START).year}-{dates[-1].year}:
-      full sample : {ratio_full:.2f}   excl. 2020 : {ratio_ex:.2f}   (<1 = beats benchmark)
+    RMSFE ratio vs AR(1), pseudo-real-time {pd.Timestamp(EVAL_START).year}-{qends[-1].year} (<1 = beats benchmark):
+      vintage        m1     m2     m3    +1m
+      full sample : {'  '.join(f"{v:.2f}" for v in nc_all['ratio'])}
+      excl. 2020  : {'  '.join(f"{v:.2f}" for v in nc_ex['ratio'])}
 
   FORECAST — next quarters (anchored on the nowcast, COVID dummies)""")
 for q in labels[1:]:
@@ -778,9 +886,10 @@ for q in labels[1:]:
           f"[{r['BVAR_p10']:+.2f}, {r['BVAR_p90']:+.2f}]")
 print(f"""
   MODEL RANKING — out-of-sample, excl. 2020 (RMSFE vs AR(1))
-    h=1..4  VAR : {'  '.join(f"{v:.2f}" for v in rel_ex.loc['VAR'])}
-    h=1..4  BVAR: {'  '.join(f"{v:.2f}" for v in rel_ex.loc['BVAR'])}
-    BVAR more accurate than VAR at {dm_wins}/{H} horizons (DM sign; not significant at 5%)
+    h=1..4  VAR      : {'  '.join(f"{v:.2f}" for v in rel_ex.loc['VAR'])}
+    h=1..4  BVAR     : {'  '.join(f"{v:.2f}" for v in rel_ex.loc['BVAR'])}
+    h=1..4  BVAR + NC: {'  '.join(f"{v:.2f}" for v in rel_ex.loc['BVAR_NC'])}
+    BVAR more accurate than VAR at {wins(dm_vb)}/{H} horizons (DM-HLN sign; significant at 5%: {sig(dm_vb)}/{H})
 
-  Outputs   : data/output/*.csv · plots/p1-p5.png
+  Outputs   : data/output/*.csv · plots/p1-p6.png
 {L}""")
